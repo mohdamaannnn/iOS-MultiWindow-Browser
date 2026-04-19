@@ -1,0 +1,136 @@
+//
+//  WindowModel.swift
+//  ArielWorkspace
+//
+//  Created by Amaan shaikh on 18/01/26.
+//
+
+import SwiftUI
+import WebKit
+import Combine
+
+// --- Snap State Enum ---
+enum WindowSnapState: String, Codable {
+    case none, top, bottom, left, right, maximized
+}
+
+// --- Unified Launcher Item ---
+struct LauncherItem: Identifiable, Codable, Equatable {
+    var id = UUID()
+    let title: String
+    let iconName: String
+    let colorHex: String
+    let type: String
+    let url: String
+}
+
+// --- Persistence Model ---
+struct SavedWindowData: Codable {
+    let id: UUID
+    let title: String
+    let appType: String
+    let x: CGFloat, y: CGFloat, w: CGFloat, h: CGFloat
+    let zIndex: Double
+    let isMinimized: Bool
+    let currentURL: String
+    let noteContent: String? // <--- FIX: This handles your Notes
+}
+
+// --- 1. THE BRAIN (Web View Model) ---
+class ArielWebViewModel: NSObject, ObservableObject, WKNavigationDelegate {
+    // --- FIX: Restored 'pageTitle' to fix the error in WindowView ---
+    @Published var pageTitle: String = "Loading..."
+    
+    @Published var currentURL: URL?
+    @Published var canGoBack: Bool = false
+    @Published var canGoForward: Bool = false
+    
+    // --- FIX: 'pendingURL' stores the file path until the window opens ---
+    var pendingURL: String = ""
+    
+    var webView: WKWebView!
+    
+    override init() {
+        super.init()
+        let config = WKWebViewConfiguration()
+        config.allowsInlineMediaPlayback = true
+        config.websiteDataStore = .default()
+        
+        let prefs = WKWebpagePreferences()
+        prefs.allowsContentJavaScript = true
+        config.defaultWebpagePreferences = prefs
+
+        self.webView = WKWebView(frame: .zero, configuration: config)
+        self.webView.customUserAgent = "Mozilla/5.0 (iPad; CPU OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1"
+        self.webView.navigationDelegate = self
+    }
+    
+    func load(url: String) {
+        guard let validURL = URL(string: url) else { return }
+        DispatchQueue.main.async { self.webView.load(URLRequest(url: validURL)) }
+    }
+    
+    func goBack() { webView.goBack() }
+    func goForward() { webView.goForward() }
+    
+    // --- FIX: Renamed 'refresh' to 'reload' so your buttons work ---
+    func reload() { webView.reload() }
+    
+    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        DispatchQueue.main.async {
+            self.currentURL = webView.url
+            self.canGoBack = webView.canGoBack
+            self.canGoForward = webView.canGoForward
+            if let title = webView.title, !title.isEmpty { self.pageTitle = title }
+        }
+    }
+    
+    func takeSnapshot(completion: @escaping (UIImage?) -> Void) {
+        let config = WKSnapshotConfiguration()
+        config.rect = webView.bounds
+        webView.takeSnapshot(with: config) { image, error in completion(image) }
+    }
+}
+
+// --- 2. THE WINDOW DATA ---
+struct AppWindow: Identifiable {
+    let id: UUID
+    var title: String
+    var appType: String
+    var position: CGPoint
+    var size: CGSize
+    var zIndex: Double
+    var isMinimized: Bool = false
+    var thumbnail: UIImage? = nil
+    var snapState: WindowSnapState = .none
+    
+    var webModel: ArielWebViewModel?
+    
+    // --- FIX: Added 'noteContent' storage ---
+    var noteContent: String = ""
+    
+    init(title: String, appType: String, position: CGPoint, size: CGSize, zIndex: Double, isMinimized: Bool, webModel: ArielWebViewModel?, noteContent: String = "") {
+        self.id = UUID()
+        self.title = title
+        self.appType = appType
+        self.position = position
+        self.size = size
+        self.zIndex = zIndex
+        self.isMinimized = isMinimized
+        self.webModel = webModel
+        self.noteContent = noteContent
+    }
+    
+    init(id: UUID, title: String, appType: String, position: CGPoint, size: CGSize, zIndex: Double, isMinimized: Bool, webModel: ArielWebViewModel?, noteContent: String = "") {
+        self.id = id
+        self.title = title
+        self.appType = appType
+        self.position = position
+        self.size = size
+        self.zIndex = zIndex
+        self.isMinimized = isMinimized
+        self.webModel = webModel
+        self.noteContent = noteContent
+    }
+}
+

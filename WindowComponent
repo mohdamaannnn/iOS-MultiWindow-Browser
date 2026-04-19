@@ -1,0 +1,402 @@
+//
+//  WindowComponent.swift
+//  ArielWorkspace
+//
+//  Created by Amaan shaikh on 18/01/26.
+//
+
+import SwiftUI
+import UniformTypeIdentifiers
+import PDFKit // <--- REQUIRED for PDFs
+
+struct WindowView: View {
+    @Binding var window: AppWindow
+    let screenSize: CGSize
+    
+    // --- Global Menu Control ---
+    @Binding var activeMenuID: UUID?
+    
+    // --- Callbacks ---
+    var onAddToApps: (String, String) -> Void
+    var onFocus: () -> Void
+    var onMinimize: () -> Void
+    var onClose: () -> Void
+
+    // --- Constants ---
+    let topMargin: CGFloat = 2
+    
+    // --- Local State ---
+    @State private var startSize: CGSize = .zero
+    @State private var startPos: CGPoint = .zero
+    @State private var isResizing: Bool = false
+    @State private var autoCloseTask: DispatchWorkItem?
+    
+    // Computed Property
+    var isMenuOpen: Bool {
+        activeMenuID == window.id
+    }
+
+    var body: some View {
+            ZStack(alignment: .bottomTrailing) {
+                
+                // 1. MAIN CONTENT
+                VStack(spacing: 0) {
+                    headerView
+                    contentView // <--- This needs to be defined below!
+                }
+                
+                // 2. RESIZE HANDLE
+                if window.snapState == .none {
+                    resizeHandle
+                }
+            }
+            .clipShape(RoundedRectangle(cornerRadius: 12))
+            
+            // --- WINDOW MODIFIERS ---
+            .frame(width: window.size.width, height: window.size.height)
+            .shadow(color: Color.black.opacity(0.2), radius: 10, x: 0, y: 5)
+            .position(window.position)
+            .onTapGesture { onFocus() }
+            .onAppear {
+                // If there is a URL waiting to be loaded, load it NOW.
+                if let model = window.webModel, !model.pendingURL.isEmpty {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                        model.load(url: model.pendingURL)
+                        // Note: For PDFs/Photos, we read pendingURL directly in contentView,
+                        // so we don't clear it immediately here for those types.
+                    }
+                }
+            }
+            .onChange(of: screenSize) { _, newSize in
+                handleRotation(newSize)
+            }
+            .onReceive(window.webModel!.$pageTitle) { newTitle in
+                if !newTitle.isEmpty && newTitle != "Loading..." { window.title = newTitle }
+            }
+            .onChange(of: activeMenuID) { _, newValue in
+                handleAutoClose(newValue)
+            }
+        }
+    
+    // MARK: - SUBVIEWS
+    
+    // --- Header / Title Bar ---
+    var headerView: some View {
+        HStack(spacing: 12) {
+            // Traffic Lights Section
+            ZStack(alignment: .leading) {
+                HStack(spacing: 6) {
+                    Circle().fill(Color.red).frame(width: 12, height: 12)
+                    Circle().fill(Color.yellow).frame(width: 12, height: 12)
+                    Circle().fill(Color.green).frame(width: 12, height: 12)
+                }
+                .padding(4)
+                .background(Color.white.opacity(0.001))
+                .onTapGesture {
+                    withAnimation(.spring(response: 0.3, dampingFraction: 0.6)) {
+                        activeMenuID = isMenuOpen ? nil : window.id
+                    }
+                }
+                
+                if isMenuOpen {
+                    expandedMenu
+                }
+            }
+            .padding(.leading, 10)
+            .zIndex(20)
+
+            // Navigation & Tools (Only show for Browser)
+            if window.appType != "Note" && window.appType != "Photo" && window.appType != "PDF" && window.webModel != nil {
+                Menu {
+                    ControlGroup {
+                        Button(action: { window.webModel?.goBack() }) { Label("Back", systemImage: "arrow.backward") }
+                            .disabled(!(window.webModel?.canGoBack ?? false))
+                        Button(action: { window.webModel?.goForward() }) { Label("Forward", systemImage: "arrow.forward") }
+                            .disabled(!(window.webModel?.canGoForward ?? false))
+                    }
+                    
+                    Button(action: { window.webModel?.reload() }) { Label("Reload", systemImage: "arrow.clockwise") }
+                    
+                    Button {
+                        if let url = window.webModel?.currentURL?.absoluteString {
+                            onAddToApps(window.webModel?.pageTitle ?? "New App", url)
+                        }
+                    } label: {
+                        Label("Add to Apps", systemImage: "star.fill")
+                    }
+                    
+                    if let url = window.webModel?.currentURL {
+                        ShareLink(item: url) { Label("Share", systemImage: "square.and.arrow.up") }
+                    }
+                } label: {
+                    Image(systemName: "ellipsis.circle")
+                        .font(.system(size: 18))
+                        .foregroundColor(.white.opacity(0.8))
+                        .padding(4)
+                        .contentShape(Rectangle())
+                }
+            }
+
+            Spacer()
+            // Window Title
+            Text(window.title)
+                .font(.caption)
+                .bold()
+                .foregroundColor(.white.opacity(0.8))
+                .lineLimit(1)
+            Spacer()
+        }
+        .frame(height: 32)
+        .background(Color.black.opacity(0.85))
+        .gesture(
+            DragGesture().onChanged { value in
+                onFocus()
+                if isMenuOpen { activeMenuID = nil }
+                if window.snapState != .none { window.snapState = .none }
+                
+                var transaction = Transaction()
+                transaction.animation = nil
+                withTransaction(transaction) {
+                    let newX = window.position.x + value.translation.width
+                    let newY = window.position.y + value.translation.height
+                    window.position = clampPosition(x: newX, y: newY, to: screenSize, size: window.size)
+                }
+            }
+        )
+        .onTapGesture {
+            onFocus()
+            if isMenuOpen { activeMenuID = nil }
+        }
+    }
+    
+    // --- Expanded Menu ---
+    var expandedMenu: some View {
+        HStack(spacing: 16) {
+            Button(action: { cancelAutoClose(); activeMenuID = nil; onClose() }) {
+                Image(systemName: "xmark").font(.system(size: 12, weight: .black)).foregroundColor(.white).frame(width: 30, height: 30).background(Circle().fill(Color.red))
+            }
+            Button(action: {
+                if let model = window.webModel {
+                    model.takeSnapshot { image in window.thumbnail = image; cancelAutoClose(); activeMenuID = nil; onMinimize() }
+                } else { cancelAutoClose(); activeMenuID = nil; onMinimize() }
+            }) {
+                Image(systemName: "minus").font(.system(size: 12, weight: .black)).foregroundColor(.white).frame(width: 30, height: 30).background(Circle().fill(Color.yellow))
+            }
+            Menu {
+                Button(action: { snapToTop() }) { Label("Snap Top", systemImage: "arrow.up.to.line") }
+                Button(action: { snapToBottom() }) { Label("Snap Bottom", systemImage: "arrow.down.to.line") }
+                Button(action: { snapToLeft() }) { Label("Snap Left", systemImage: "arrow.left.to.line") }
+                Button(action: { snapToRight() }) { Label("Snap Right", systemImage: "arrow.right.to.line") }
+                Button(action: { maximizeWindow() }) { Label("Maximize", systemImage: "arrow.up.left.and.arrow.down.right") }
+            } label: {
+                Image(systemName: "arrow.up.left.and.arrow.down.right").font(.system(size: 12, weight: .black)).foregroundColor(.white).frame(width: 30, height: 30).background(Circle().fill(Color.green))
+            }
+            .simultaneousGesture(DragGesture(minimumDistance: 0).onChanged { _ in cancelAutoClose() })
+        }
+        .padding(.horizontal, 10).padding(.vertical, 8).background(Color.black).clipShape(Capsule())
+        .overlay(Capsule().stroke(Color.white.opacity(0.15), lineWidth: 1)).shadow(color: .black.opacity(0.5), radius: 10, x: 0, y: 5).offset(x: -6, y: 0)
+        .transition(.scale(scale: 0.1, anchor: .leading).combined(with: .opacity))
+    }
+    
+    // --- THIS IS THE PART THAT WAS MISSING ---
+    var contentView: some View {
+        ZStack {
+            Color.white // Base Background
+            
+            if window.appType == "PDF" {
+                // --- CASE 1: PDF VIEWER ---
+                // We use URL(fileURLWithPath:) because we saved the local file path string
+                if let path = window.webModel?.pendingURL, !path.isEmpty {
+                    WorkspacePDFView(url: URL(fileURLWithPath: path))
+                } else if let url = window.webModel?.currentURL {
+                    WorkspacePDFView(url: url)
+                } else {
+                    Text("PDF Source Not Found").foregroundColor(.gray)
+                }
+            }
+            else if window.appType == "Photo" {
+                // --- CASE 2: PHOTO VIEWER ---
+                if let path = window.webModel?.pendingURL, !path.isEmpty, let image = UIImage(contentsOfFile: path) {
+                    Image(uiImage: image).resizable().aspectRatio(contentMode: .fit)
+                } else if let url = window.webModel?.currentURL, let image = UIImage(contentsOfFile: url.path) {
+                    Image(uiImage: image).resizable().aspectRatio(contentMode: .fit)
+                } else {
+                    Text("Image Not Found").foregroundColor(.gray)
+                }
+            }
+            else if window.appType == "Note" {
+                // --- CASE 3: NOTES APP ---
+                TextEditor(text: $window.noteContent)
+                    .padding()
+                    .foregroundColor(.black)
+            }
+            else {
+                // --- CASE 4: WEB BROWSER (Default) ---
+                if let model = window.webModel {
+                    WebViewContainer(viewModel: model)
+                } else {
+                    Color.white
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .onTapGesture {
+            onFocus()
+            if isMenuOpen { activeMenuID = nil }
+        }
+    }
+    // ------------------------------------------
+    
+    // --- Resize Handle (Arrow) ---
+    var resizeHandle: some View {
+        Image(systemName: "arrow.down.forward.circle.fill")
+            .foregroundColor(.black.opacity(0.5))
+            .font(.title2)
+            .padding(4)
+            .background(Color.white.opacity(0.1))
+            .gesture(
+                DragGesture(coordinateSpace: .global)
+                    .onChanged { value in
+                        if !isResizing {
+                            startSize = window.size
+                            startPos = window.position
+                            isResizing = true
+                            window.snapState = .none
+                            if isMenuOpen { activeMenuID = nil }
+                        }
+                        
+                        let rawWidth = startSize.width + value.translation.width
+                        let rawHeight = startSize.height + value.translation.height
+                        let newWidth = max(200, rawWidth)
+                        let newHeight = max(150, rawHeight)
+                        
+                        let appliedDeltaW = newWidth - startSize.width
+                        let appliedDeltaH = newHeight - startSize.height
+                        
+                        var transaction = Transaction()
+                        transaction.animation = nil
+                        withTransaction(transaction) {
+                            window.size = CGSize(width: newWidth, height: newHeight)
+                            window.position = CGPoint(
+                                x: startPos.x + (appliedDeltaW * 0.5),
+                                y: startPos.y + (appliedDeltaH * 0.5)
+                            )
+                        }
+                    }
+                    .onEnded { _ in isResizing = false }
+            )
+    }
+
+    // MARK: - Logic & Helpers
+    
+    func handleAutoClose(_ newValue: UUID?) {
+        cancelAutoClose()
+        let currentID = window.id
+        if newValue == currentID {
+            let task = DispatchWorkItem {
+                withAnimation(.easeOut(duration: 0.2)) {
+                    if activeMenuID == currentID {
+                        activeMenuID = nil
+                    }
+                }
+            }
+            autoCloseTask = task
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2.0, execute: task)
+        }
+    }
+    
+    func cancelAutoClose() {
+        autoCloseTask?.cancel()
+        autoCloseTask = nil
+    }
+    
+    func handleRotation(_ newSize: CGSize) {
+        let safeWidth = min(window.size.width, newSize.width - 20)
+        let safeHeight = min(window.size.height, newSize.height - (topMargin + 20))
+        
+        if window.size.width > safeWidth || window.size.height > safeHeight {
+            window.size = CGSize(width: safeWidth, height: safeHeight)
+        }
+        
+        let updatePos = {
+            window.position = clampPosition(x: window.position.x, y: window.position.y, to: newSize, size: window.size)
+        }
+        
+        if newSize.width > newSize.height {
+            if window.snapState == .top { snapToLeft(animate: true) }
+            else if window.snapState == .bottom { snapToRight(animate: true) }
+            else if window.snapState == .maximized { maximizeWindow(animate: true) }
+            else { withAnimation(.spring()) { updatePos() } }
+        } else {
+            if window.snapState == .left { snapToTop(animate: true) }
+            else if window.snapState == .right { snapToBottom(animate: true) }
+            else if window.snapState == .maximized { maximizeWindow(animate: true) }
+            else { withAnimation(.spring()) { updatePos() } }
+        }
+    }
+    
+    func clampPosition(x: CGFloat, y: CGFloat, to screenSize: CGSize, size: CGSize) -> CGPoint {
+        let halfWidth = size.width / 2
+        let halfHeight = size.height / 2
+        let safeX = min(max(x, halfWidth), screenSize.width - halfWidth)
+        let safeY = min(max(y, halfHeight + topMargin), screenSize.height - halfHeight)
+        return CGPoint(x: safeX, y: safeY)
+    }
+    
+    // --- Snapping Logic ---
+    func snapToTop(animate: Bool = true) {
+        runSnap(w: screenSize.width - 20, h: (screenSize.height / 2) - 10, x: screenSize.width / 2, y: topMargin + ((screenSize.height / 2) - 10) / 2, state: .top, animate: animate)
+    }
+    func snapToBottom(animate: Bool = true) {
+        let h = (screenSize.height / 2) - 20
+        runSnap(w: screenSize.width - 20, h: h, x: screenSize.width / 2, y: screenSize.height - h / 2 - 10, state: .bottom, animate: animate)
+    }
+    func snapToLeft(animate: Bool = true) {
+        let w = (screenSize.width / 2) - 10
+        let h = screenSize.height - (topMargin + 10)
+        runSnap(w: w, h: h, x: w / 2 + 5, y: topMargin + h / 2, state: .left, animate: animate)
+    }
+    func snapToRight(animate: Bool = true) {
+        let w = (screenSize.width / 2) - 10
+        let h = screenSize.height - (topMargin + 10)
+        runSnap(w: w, h: h, x: screenSize.width - w / 2 - 5, y: topMargin + h / 2, state: .right, animate: animate)
+    }
+    func maximizeWindow(animate: Bool = true) {
+        let w = screenSize.width - 10
+        let h = screenSize.height - (topMargin + 10)
+        runSnap(w: w, h: h, x: screenSize.width / 2, y: topMargin + h / 2, state: .maximized, animate: animate)
+    }
+    
+    func runSnap(w: CGFloat, h: CGFloat, x: CGFloat, y: CGFloat, state: WindowSnapState, animate: Bool) {
+        let logic = {
+            window.snapState = state
+            cancelAutoClose()
+            activeMenuID = nil
+            window.size = CGSize(width: w, height: h)
+            window.position = clampPosition(x: x, y: y, to: screenSize, size: window.size)
+        }
+        if animate { withAnimation { logic() } } else { logic() }
+    }
+}
+
+#if canImport(PDFKit)
+struct WorkspacePDFView: UIViewRepresentable {
+    let url: URL
+
+    func makeUIView(context: Context) -> PDFView {
+        let pdfView = PDFView()
+        pdfView.autoScales = true
+        pdfView.displayMode = .singlePageContinuous
+        pdfView.displayDirection = .vertical
+        return pdfView
+    }
+
+    func updateUIView(_ uiView: PDFView, context: Context) {
+        if uiView.document?.documentURL != url {
+            if let document = PDFDocument(url: url) {
+                uiView.document = document
+            }
+        }
+    }
+}
+#endif

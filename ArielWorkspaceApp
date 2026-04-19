@@ -1,0 +1,17 @@
+//
+//  ArielWorkspaceApp.swift
+//  ArielWorkspace
+//
+//  Created by Amaan shaikh on 18/01/26.
+//
+
+import SwiftUI
+
+@main
+struct ArielWorkspaceApp: App {
+    var body: some Scene {
+        WindowGroup {
+            ContentView()
+        }
+    }
+}

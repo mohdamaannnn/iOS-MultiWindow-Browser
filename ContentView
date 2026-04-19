@@ -1,0 +1,645 @@
+//
+//  ContentView.swift
+//  ArielWorkspace
+//
+//  Created by Amaan shaikh on 18/01/26.
+//
+
+import SwiftUI
+import PhotosUI
+import UniformTypeIdentifiers
+
+// --- 1. MAIN VIEW ---
+@MainActor
+struct ContentView: View {
+    @State private var windows: [AppWindow] = []
+    @State private var bursts: [DisintegrationEffect] = []
+    @State private var topZIndex: Double = 1
+    
+    // UI State
+    @State private var showAppsFolder: Bool = false
+    @State private var activeMenuID: UUID? = nil
+    @Namespace private var animationNamespace
+    @Namespace private var dockNamespace
+    
+    // Settings & Dock
+    @AppStorage("enableAutoHide") private var enableAutoHide: Bool = false
+    @State private var isDockHidden: Bool = false
+    @State private var dockHiddenSide: Edge = .leading
+    @State private var showSettings: Bool = false
+    @State private var wallpaperColor: Color = .black
+    @State private var wallpaperImage: UIImage? = nil
+    @State private var selectedPhotoItem: PhotosPickerItem? = nil
+    
+    // Launcher Data
+    @State private var launcherItems: [LauncherItem] = []
+    @State private var isEditingApps: Bool = false
+    @State private var draggedWindow: AppWindow?
+    @State private var draggedLauncherItem: LauncherItem?
+
+    var body: some View {
+        GeometryReader { geo in
+            ZStack {
+
+                // 1. WALLPAPER LAYER
+                Group {
+                    if let image = wallpaperImage {
+                        Image(uiImage: image)
+                            .resizable()
+                            .aspectRatio(contentMode: .fill)
+                            .frame(minWidth: 0, maxWidth: .infinity, minHeight: 0, maxHeight: .infinity)
+                            .clipped()
+                    } else {
+                        wallpaperColor
+                    }
+                }
+                .edgesIgnoringSafeArea(.all)
+                .zIndex(0)
+                .onTapGesture {
+                    if showAppsFolder { withAnimation(.spring()) { showAppsFolder = false; isEditingApps = false } }
+                    if activeMenuID != nil { withAnimation { activeMenuID = nil } }
+                }
+                
+                // --- FIX: ROBUST FILE DROP HANDLER ---
+                .onDrop(of: [UTType.url, UTType.fileURL, UTType.pdf, UTType.image, UTType.text, UTType.content, UTType.data], isTargeted: nil) { providers in
+                    // 1. Internal Drag (Reordering Windows)
+                    if handleDrop(on: nil) { return true }
+                    
+                    if let provider = providers.first {
+                        let screenSize = geo.size
+                        
+                        // A. HANDLE PDF SPECIFICALLY
+                        if provider.hasItemConformingToTypeIdentifier(UTType.pdf.identifier) {
+                            provider.loadFileRepresentation(forTypeIdentifier: UTType.pdf.identifier) { url, error in
+                                if let safeUrl = url { importFile(url: safeUrl, type: "PDF", screenSize: screenSize) }
+                            }
+                            return true
+                        }
+                        
+                        // B. HANDLE IMAGES SPECIFICALLY
+                        if provider.hasItemConformingToTypeIdentifier(UTType.image.identifier) {
+                            provider.loadFileRepresentation(forTypeIdentifier: UTType.image.identifier) { url, error in
+                                if let safeUrl = url { importFile(url: safeUrl, type: "Photo", screenSize: screenSize) }
+                            }
+                            return true
+                        }
+                        
+                        // C. HANDLE GENERIC FILE URLs
+                        if provider.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) {
+                            provider.loadFileRepresentation(forTypeIdentifier: UTType.fileURL.identifier) { url, error in
+                                guard let safeUrl = url else { return }
+                                let ext = safeUrl.pathExtension.lowercased()
+                                let type = (ext == "pdf") ? "PDF" : (["jpg", "png", "jpeg", "heic"].contains(ext) ? "Photo" : "Note")
+                                importFile(url: safeUrl, type: type, screenSize: screenSize)
+                            }
+                            return true
+                        }
+                        
+                        // D. HANDLE TEXT / WEB LINKS
+                        _ = provider.loadObject(ofClass: String.self) { string, _ in
+                            DispatchQueue.main.async {
+                                guard let dataStr = string else { return }
+                                if let data = dataStr.data(using: .utf8),
+                                   let item = try? JSONDecoder().decode(LauncherItem.self, from: data) {
+                                    if !item.url.isEmpty { addNewWindow(title: item.title, type: item.type, url: item.url, screenSize: screenSize) }
+                                }
+                                else if let url = URL(string: dataStr), url.scheme != nil {
+                                    addNewWindow(title: "Web Link", type: "Browser", url: url.absoluteString, screenSize: screenSize)
+                                }
+                            }
+                        }
+                        return true
+                    }
+                    return false
+                }
+              
+                // 2. WINDOW LAYER
+                ForEach($windows) { $window in
+                    if !window.isMinimized {
+                        WindowView(
+                            window: $window,
+                            screenSize: geo.size,
+                            activeMenuID: $activeMenuID,
+                            onAddToApps: { title, url in addBookmark(title: title, url: url) },
+                            onFocus: { bringToFront(id: window.id) },
+                            onMinimize: { withAnimation(.spring(response: 0.5, dampingFraction: 0.8)) { window.isMinimized = true } },
+                            onClose: {
+                                triggerDisintegration(at: window.position, size: window.size)
+                                windows.removeAll(where: { $0.id == window.id })
+                            }
+                        )
+                        .matchedGeometryEffect(id: window.id, in: animationNamespace)
+                        .transition(.scale(scale: 0.1).combined(with: .opacity))
+                        .zIndex(window.zIndex)
+                        .onDrop(of: [UTType.text], isTargeted: nil) { _ in handleDrop(on: window) }
+                    }
+                }
+              
+                // 3. EFFECTS LAYER
+                ForEach(bursts) { burst in ModernDustView(windowSize: burst.size).position(burst.position).zIndex(999) }
+              
+                // 4. APPS MENU
+                if showAppsFolder {
+                    VStack {
+                        Spacer()
+                        AppsMenuGrid(
+                            screenSize: geo.size,
+                            items: $launcherItems,
+                            draggedItem: $draggedLauncherItem,
+                            isEditingApps: $isEditingApps,
+                            onLaunch: { title, type, url in launchOrFocus(title: title, type: type, url: url, size: geo.size) },
+                            onOpenSettings: { withAnimation { showAppsFolder = false }; DispatchQueue.main.asyncAfter(deadline: .now()+0.1) { showSettings = true } },
+                            onDelete: { item in deleteItem(item) },
+                            onMinimizeAll: { minimizeAll() },
+                            onCloseAll: { closeAll() },
+                            onCloseMenu: { withAnimation(.spring()) { showAppsFolder = false; isEditingApps = false } }
+                        )
+                        .padding(.bottom, geo.size.width > geo.size.height ? 20 : 100)
+                        .padding(.horizontal, 20)
+                    }
+                    .zIndex(1002)
+                    .transition(.move(edge: .bottom).combined(with: .opacity))
+                }
+
+                // 5. MORPHING DOCK
+                VStack {
+                    Spacer()
+                    if isDockHidden && enableAutoHide {
+                        HStack {
+                            if dockHiddenSide == .trailing { Spacer() }
+                            Button(action: { withAnimation(.spring(response: 0.5, dampingFraction: 0.8)) { isDockHidden = false } }) {
+                                ZStack {
+                                    Circle().fill(.ultraThinMaterial).frame(width: 50, height: 50)
+                                        .shadow(color: .black.opacity(0.3), radius: 5)
+                                        .overlay(Circle().stroke(Color.white.opacity(0.2), lineWidth: 1))
+                                    Image(systemName: "dock.rectangle").foregroundColor(.white).font(.title2)
+                                }
+                            }
+                            .matchedGeometryEffect(id: "DockBackground", in: dockNamespace)
+                            .padding(dockHiddenSide == .leading ? .leading : .trailing, 20)
+                            .padding(.bottom, 30)
+                            if dockHiddenSide == .leading { Spacer() }
+                        }
+                        .transition(.scale(scale: 0.8, anchor: dockHiddenSide == .leading ? .bottomLeading : .bottomTrailing))
+                    } else {
+                        // EXPANDED DOCK
+                        HStack(alignment: .bottom, spacing: 12) {
+                            VStack(spacing: 4) {
+                                DockButton(icon: "apps.iphone", color: .blue) {
+                                    withAnimation(.spring(response: 0.4, dampingFraction: 0.7)) { showAppsFolder.toggle(); isEditingApps = false }
+                                }
+                                Circle().fill(Color.white).frame(width: 4, height: 4)
+                            }
+                            if !windows.isEmpty {
+                                Rectangle().fill(Color.white.opacity(0.3)).frame(width: 1, height: 30)
+                                    .padding(.horizontal, 4).padding(.bottom, 8)
+                            }
+                            ForEach(windows) { window in
+                                Button(action: { toggleWindow(window) }) {
+                                    VStack(spacing: 4) {
+                                        if let thumb = window.thumbnail, window.isMinimized {
+                                            Image(uiImage: thumb)
+                                                .resizable()
+                                                .aspectRatio(contentMode: .fill)
+                                                .frame(width: 45, height: 45)
+                                                .cornerRadius(10)
+                                                .overlay(RoundedRectangle(cornerRadius: 10).stroke(Color.white.opacity(0.3), lineWidth: 1))
+                                                .matchedGeometryEffect(id: window.id, in: animationNamespace)
+                                        } else {
+                                            ZStack {
+                                                RoundedRectangle(cornerRadius: 10).fill(appColor(for: window.appType).gradient).frame(width: 45, height: 45)
+                                                Image(systemName: appIcon(for: window.appType)).foregroundColor(.white).font(.title3)
+                                            }
+                                        }
+                                        Circle().fill(Color.white).frame(width: 4, height: 4).opacity(window.isMinimized ? 0.4 : 1.0)
+                                    }
+                                }
+                                .onDrag {
+                                    self.draggedWindow = window
+                                    return NSItemProvider(object: window.id.uuidString as NSString)
+                                }
+                                .onDrop(of: [UTType.text], delegate: DropViewDelegate(item: window, items: $windows, draggedItem: $draggedWindow))
+                            }
+                        }
+                        .padding(10)
+                        .contentShape(Rectangle())
+                        .background {
+                            RoundedRectangle(cornerRadius: 22).fill(.ultraThinMaterial)
+                                .shadow(color: .black.opacity(0.4), radius: 10, x: 0, y: 5)
+                                .matchedGeometryEffect(id: "DockBackground", in: dockNamespace)
+                        }
+                        .gesture(
+                            DragGesture(minimumDistance: 20).onEnded { value in
+                                if abs(value.translation.width) > 50 && enableAutoHide {
+                                    dockHiddenSide = value.translation.width > 0 ? .trailing : .leading
+                                    withAnimation(.spring(response: 0.5, dampingFraction: 0.8)) { isDockHidden = true }
+                                }
+                            }
+                        )
+                        .padding(.bottom, 20)
+                    }
+                }
+                .zIndex(1000)
+            }
+            .ignoresSafeArea(.keyboard)
+            .sheet(isPresented: $showSettings) {
+                SettingsView(wallpaperColor: $wallpaperColor, selectedPhotoItem: $selectedPhotoItem, wallpaperImage: $wallpaperImage, enableAutoHide: $enableAutoHide, onClearWindows: { windows.removeAll() })
+                    .presentationDetents([.medium])
+            }
+            .onChange(of: windows.count) { _, _ in saveState() }
+            .onChange(of: launcherItems.count) { _, _ in saveState() }
+            .onChange(of: wallpaperImage) { _,_ in saveState() }
+            .onChange(of: wallpaperColor) { _,_ in saveState() }
+            .onAppear { loadState() }
+        }
+        .ignoresSafeArea(.keyboard)
+    }
+
+    // --- HELPER: SECURE IMPORT FILE ---
+    func importFile(url: URL, type: String, screenSize: CGSize) {
+        // 1. Get Documents Directory
+        guard let documents = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first else { return }
+        
+        // 2. Create Destination URL
+        let destination = documents.appendingPathComponent(url.lastPathComponent)
+        
+        // 3. Secure Copy
+        // loadFileRepresentation gives us a temporary URL that we MUST copy from immediately.
+        do {
+            if FileManager.default.fileExists(atPath: destination.path) {
+                try FileManager.default.removeItem(at: destination)
+            }
+            try FileManager.default.copyItem(at: url, to: destination)
+            print("File imported successfully to: \(destination.path)")
+        } catch {
+            print("Failed to copy file: \(error.localizedDescription)")
+            return
+        }
+        
+        // 4. Update UI on Main Thread
+        DispatchQueue.main.async {
+            addNewWindow(
+                title: url.lastPathComponent,
+                type: type,
+                url: destination.path, // We use the SAFE local path
+                screenSize: screenSize
+            )
+        }
+    }
+
+    // --- LOGIC FUNCTIONS ---
+    
+    func handleDrop(on target: AppWindow?) -> Bool {
+        if let dropped = draggedWindow {
+            if let idx = windows.firstIndex(where: { $0.id == dropped.id }) {
+                withAnimation(.spring(response: 0.5, dampingFraction: 1.0)) {
+                    windows[idx].isMinimized = false
+                    bringToFront(id: dropped.id)
+                }
+            }
+            return true
+        }
+        return false
+    }
+
+    func toggleWindow(_ window: AppWindow) {
+        if let idx = windows.firstIndex(where: { $0.id == window.id }) {
+            if windows[idx].isMinimized {
+                withAnimation(.spring(response: 0.5, dampingFraction: 0.8)) {
+                    windows[idx].isMinimized = false
+                    bringToFront(id: window.id)
+                }
+            } else {
+                bringToFront(id: window.id)
+            }
+        }
+    }
+
+    func launchOrFocus(title: String, type: String, url: String, size: CGSize) {
+        withAnimation { showAppsFolder = false }
+        if type != "Google" && !type.starts(with: "Bookmark"), let existingIdx = windows.firstIndex(where: { $0.appType == type }) {
+            withAnimation(.spring(response: 0.5, dampingFraction: 1.0)) {
+                windows[existingIdx].isMinimized = false
+                bringToFront(id: windows[existingIdx].id)
+            }
+        } else {
+            addNewWindow(title: title, type: type, url: url, screenSize: size)
+        }
+    }
+
+    func addNewWindow(title: String, type: String, url: String, screenSize: CGSize) {
+        topZIndex += 1
+        let model = ArielWebViewModel()
+        
+        if type == "Browser" || type == "Google" || type == "YouTube" {
+            model.load(url: url)
+        } else {
+            model.pendingURL = url
+        }
+        
+        let safeHeight = min(480, screenSize.height - 60)
+        let safeWidth = min(340, screenSize.width - 40)
+        
+        var noteText = ""
+        if type == "Note" {
+            if let content = try? String(contentsOfFile: url) {
+                noteText = content
+            }
+        }
+        
+        let newWindow = AppWindow(
+            title: title, appType: type, position: CGPoint(x: screenSize.width/2, y: screenSize.height/2),
+            size: CGSize(width: safeWidth, height: safeHeight), zIndex: topZIndex, isMinimized: false, webModel: model, noteContent: noteText
+        )
+        withAnimation(.spring(response: 0.5, dampingFraction: 1.0)) { windows.append(newWindow) }
+    }
+    
+    func minimizeAll() {
+        withAnimation(.spring(response: 0.5, dampingFraction: 1.0)) {
+            for i in windows.indices {
+                if !windows[i].isMinimized {
+                    windows[i].webModel?.takeSnapshot { img in windows[i].thumbnail = img; windows[i].isMinimized = true }
+                    windows[i].isMinimized = true
+                }
+            }
+            showAppsFolder = false
+        }
+    }
+    
+    func closeAll() {
+        withAnimation { windows.removeAll(); showAppsFolder = false }
+    }
+    
+    func bringToFront(id: UUID) { topZIndex += 1; if let index = windows.firstIndex(where: { $0.id == id }) { windows[index].zIndex = topZIndex } }
+    func triggerDisintegration(at position: CGPoint, size: CGSize) { let id = UUID(); bursts.append(DisintegrationEffect(id: id, position: position, size: size)); DispatchQueue.main.asyncAfter(deadline: .now()+1.2) { bursts.removeAll(where: {$0.id == id}) } }
+
+    // --- PERSISTENCE & DATA ---
+    func saveState() {
+        if let data = try? JSONEncoder().encode(launcherItems) { UserDefaults.standard.set(data, forKey: "savedLauncherItems") }
+        
+        let savedData = windows.map { w in
+            SavedWindowData(
+                id: w.id,
+                title: w.title,
+                appType: w.appType,
+                x: w.position.x,
+                y: w.position.y,
+                w: w.size.width,
+                h: w.size.height,
+                zIndex: w.zIndex,
+                isMinimized: w.isMinimized,
+                currentURL: w.webModel?.currentURL?.absoluteString ?? "",
+                noteContent: w.noteContent
+            )
+        }
+        
+        if let data = try? JSONEncoder().encode(savedData) { UserDefaults.standard.set(data, forKey: "savedWindows") }
+        
+        if let image = wallpaperImage, let data = image.jpegData(compressionQuality: 0.7) {
+            try? data.write(to: getWallpaperURL())
+        } else {
+            try? FileManager.default.removeItem(at: getWallpaperURL())
+        }
+        
+        if let components = UIColor(wallpaperColor).cgColor.components {
+            UserDefaults.standard.set(components, forKey: "savedWallpaperColor")
+        }
+    }
+    
+    func loadState() {
+        if let data = UserDefaults.standard.data(forKey: "savedLauncherItems"), let decoded = try? JSONDecoder().decode([LauncherItem].self, from: data) {
+            launcherItems = decoded
+        } else {
+            launcherItems = [
+                LauncherItem(title: "Google", iconName: "globe", colorHex: "#0000FF", type: "Google", url: "https://www.google.com"),
+                LauncherItem(title: "YouTube", iconName: "play.rectangle.fill", colorHex: "#FF0000", type: "YouTube", url: "https://www.youtube.com"),
+                LauncherItem(title: "Instagram", iconName: "camera.fill", colorHex: "#FF007F", type: "Instagram", url: "https://www.instagram.com"),
+                LauncherItem(title: "Settings", iconName: "gearshape.fill", colorHex: "#808080", type: "Action-Settings", url: ""),
+                LauncherItem(title: "Hide All", iconName: "arrow.down.right.and.arrow.up.left", colorHex: "#FFA500", type: "Action-HideAll", url: ""),
+                LauncherItem(title: "Close All", iconName: "trash.fill", colorHex: "#FF0000", type: "Action-CloseAll", url: "")
+            ]
+        }
+        
+        if let data = UserDefaults.standard.data(forKey: "savedWindows"), let decoded = try? JSONDecoder().decode([SavedWindowData].self, from: data) {
+            self.windows = decoded.map { saved in
+                let model = ArielWebViewModel()
+                if !saved.currentURL.isEmpty {
+                    model.pendingURL = saved.currentURL
+                }
+                
+                return AppWindow(
+                    id: saved.id,
+                    title: saved.title,
+                    appType: saved.appType,
+                    position: CGPoint(x: saved.x, y: saved.y),
+                    size: CGSize(width: saved.w, height: saved.h),
+                    zIndex: saved.zIndex,
+                    isMinimized: saved.isMinimized,
+                    webModel: model,
+                    noteContent: saved.noteContent ?? ""
+                )
+            }
+        }
+        
+        let url = getWallpaperURL()
+        if let data = try? Data(contentsOf: url), let image = UIImage(data: data) {
+            self.wallpaperImage = image
+        } else {
+            if let components = UserDefaults.standard.array(forKey: "savedWallpaperColor") as? [CGFloat], components.count >= 3 {
+                self.wallpaperColor = Color(UIColor(red: components[0], green: components[1], blue: components[2], alpha: components.count > 3 ? components[3] : 1))
+            }
+        }
+    }
+    
+    func addBookmark(title: String, url: String) {
+        let colors = ["#FF5733", "#33FF57", "#3357FF", "#F333FF", "#FF33A8", "#33FFF5"]
+        let new = LauncherItem(title: title, iconName: "star.fill", colorHex: colors.randomElement() ?? "#555", type: "Bookmark", url: url)
+        withAnimation { launcherItems.append(new) }
+    }
+    func deleteItem(_ item: LauncherItem) { withAnimation { launcherItems.removeAll(where: { $0.id == item.id }) } }
+    
+    func appIcon(for type: String) -> String {
+        if type.starts(with: "Bookmark") { return "star.fill" }
+        switch type {
+        case "Google": return "globe"
+        case "YouTube": return "play.rectangle.fill"
+        case "Instagram": return "camera.fill"
+        case "Browser": return "safari"
+        case "PDF": return "doc.text.fill"
+        case "Photo": return "photo"
+        case "Note": return "note.text"
+        default: return "macwindow"
+        }
+    }
+    func appColor(for type: String) -> Color {
+        if type.starts(with: "Bookmark") { return .orange }
+        switch type {
+        case "Google": return .blue
+        case "YouTube": return .red
+        case "Instagram": return .pink
+        case "Browser": return .blue
+        case "PDF": return .red
+        case "Photo": return .green
+        case "Note": return .yellow
+        default: return .gray
+        }
+    }
+    func getWallpaperURL() -> URL {
+        let paths = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)
+        return paths[0].appendingPathComponent("currentWallpaper.jpg")
+    }
+}
+
+// --- NEW REORDERABLE GRID WITH LANDSCAPE SUPPORT ---
+@MainActor
+struct AppsMenuGrid: View {
+    let screenSize: CGSize
+    @Binding var items: [LauncherItem]
+    @Binding var draggedItem: LauncherItem?
+    @Binding var isEditingApps: Bool
+    
+    var onLaunch: (String, String, String) -> Void
+    var onOpenSettings: () -> Void
+    var onDelete: (LauncherItem) -> Void
+    var onMinimizeAll: () -> Void
+    var onCloseAll: () -> Void
+    var onCloseMenu: () -> Void
+    
+    var columns: [GridItem] {
+        let isLandscape = screenSize.width > screenSize.height
+        return Array(repeating: GridItem(.flexible()), count: isLandscape ? 4 : 3)
+    }
+
+    var body: some View {
+        VStack(spacing: 20) {
+            if screenSize.width > screenSize.height {
+                HStack {
+                    Spacer()
+                    Button(action: onCloseMenu) {
+                        Image(systemName: "xmark.circle.fill")
+                            .font(.title2)
+                            .foregroundColor(.white.opacity(0.6))
+                    }
+                    .padding(.trailing, 10)
+                    .padding(.top, 10)
+                }
+            }
+            
+            ScrollView {
+                LazyVGrid(columns: columns, spacing: 25) {
+                    ForEach(items) { item in
+                        ZStack(alignment: .topTrailing) {
+                            AppIconView(name: item.title, color: Color(hex: item.colorHex), icon: item.iconName) {
+                                switch item.type {
+                                case "Action-Settings": onOpenSettings()
+                                case "Action-HideAll": onMinimizeAll()
+                                case "Action-CloseAll": onCloseAll()
+                                default: onLaunch(item.title, item.type, item.url)
+                                }
+                            }
+                            if isEditingApps && !isSystemAction(item) {
+                                Button(action: { onDelete(item) }) {
+                                    Image(systemName: "minus.circle.fill").foregroundColor(.red).background(Circle().fill(.white)).font(.title3)
+                                }
+                                .offset(x: 10, y: -10)
+                            }
+                        }
+                        .onLongPressGesture { withAnimation { isEditingApps = true } }
+                        .onDrag {
+                            self.draggedItem = item
+                            if let data = try? JSONEncoder().encode(item), let str = String(data: data, encoding: .utf8) {
+                                return NSItemProvider(object: str as NSString)
+                            }
+                            return NSItemProvider(object: item.title as NSString)
+                        }
+                        .onDrop(of: [UTType.text], delegate: ReorderDelegate(item: item, items: $items, draggedItem: $draggedItem))
+                    }
+                    
+                    if isEditingApps {
+                        Button(action: { withAnimation { isEditingApps = false } }) {
+                            Text("Done").bold().foregroundColor(.white).padding(.vertical, 8).padding(.horizontal, 20).background(Capsule().fill(Color.blue))
+                        }
+                        .gridCellColumns(columns.count)
+                    }
+                }
+                .padding(.horizontal, 10)
+                .padding(.top, screenSize.width > screenSize.height ? 0 : 20)
+            }
+        }
+        .padding(20).background(.ultraThinMaterial).background(Color.black.opacity(0.4))
+        .cornerRadius(30).shadow(color: .black.opacity(0.4), radius: 20, y: 10)
+        .frame(
+            width: screenSize.width > screenSize.height ? 480 : 340,
+            height: screenSize.width > screenSize.height ? 280 : 450
+        )
+    }
+    
+    func isSystemAction(_ item: LauncherItem) -> Bool {
+        return item.type.starts(with: "Action")
+    }
+}
+
+// --- DELEGATES & HELPERS ---
+struct ReorderDelegate: DropDelegate {
+    let item: LauncherItem
+    @Binding var items: [LauncherItem]
+    @Binding var draggedItem: LauncherItem?
+
+    func performDrop(info: DropInfo) -> Bool { return true }
+    func dropEntered(info: DropInfo) {
+        guard let d = draggedItem else { return }
+        if d.id != item.id {
+            if let from = items.firstIndex(where: { $0.id == d.id }),
+               let to = items.firstIndex(where: { $0.id == item.id }) {
+                withAnimation {
+                    items.move(fromOffsets: IndexSet(integer: from), toOffset: to > from ? to + 1 : to)
+                }
+            }
+        }
+    }
+}
+
+extension View {
+    @ViewBuilder func `if`<Content: View>(_ condition: Bool, transform: (Self) -> Content) -> some View {
+        if condition { transform(self) } else { self }
+    }
+}
+extension Color {
+    init(hex: String) {
+        let hex = hex.trimmingCharacters(in: CharacterSet.alphanumerics.inverted)
+        var int: UInt64 = 0
+        Scanner(string: hex).scanHexInt64(&int)
+        let a, r, g, b: UInt64
+        switch hex.count {
+        case 3: (a, r, g, b) = (255, (int >> 8) * 17, (int >> 4 & 0xF) * 17, (int & 0xF) * 17)
+        case 6: (a, r, g, b) = (255, int >> 16, int >> 8 & 0xFF, int & 0xFF)
+        case 8: (a, r, g, b) = (int >> 24, int >> 16 & 0xFF, int >> 8 & 0xFF, int & 0xFF)
+        default: (a, r, g, b) = (1, 1, 1, 0)
+        }
+        self.init(.sRGB, red: Double(r) / 255, green: Double(g) / 255, blue: Double(b) / 255, opacity: Double(a) / 255)
+    }
+}
+struct AppIconView: View {
+    let name: String; let color: Color; let icon: String; let action: () -> Void
+    var body: some View {
+        Button(action: action) {
+            VStack(spacing: 8) {
+                ZStack {
+                    RoundedRectangle(cornerRadius: 14).fill(color.gradient).frame(width: 60, height: 60).shadow(radius: 4).overlay(RoundedRectangle(cornerRadius: 14).stroke(Color.white.opacity(0.3), lineWidth: 1))
+                    Image(systemName: icon).font(.system(size: 26)).foregroundColor(.white)
+                }
+                Text(name).font(.system(size: 12, weight: .medium)).foregroundColor(.white).lineLimit(1)
+            }
+        }
+    }
+}
+struct DropViewDelegate: DropDelegate {
+    let item: AppWindow; @Binding var items: [AppWindow]; @Binding var draggedItem: AppWindow?
+    func performDrop(info: DropInfo) -> Bool { true }
+    func dropEntered(info: DropInfo) { guard let d = draggedItem else { return }; if d.id != item.id, let f = items.firstIndex(where:{$0.id == d.id}), let t = items.firstIndex(where:{$0.id == item.id}) { withAnimation { items.move(fromOffsets: IndexSet(integer: f), toOffset: t > f ? t+1 : t) } } }
+}
+struct DockButton: View { let icon: String; let color: Color; let action: () -> Void; var body: some View { Button(action: action) { ZStack { RoundedRectangle(cornerRadius: 12).fill(color.gradient).frame(width: 45, height: 45).shadow(radius: 2).overlay(RoundedRectangle(cornerRadius: 12).stroke(Color.white.opacity(0.2))); Image(systemName: icon).foregroundColor(.white).font(.title3) } } } }
+struct SettingsView: View { @Binding var wallpaperColor: Color; @Binding var selectedPhotoItem: PhotosPickerItem?; @Binding var wallpaperImage: UIImage?; @Binding var enableAutoHide: Bool; var onClearWindows: () -> Void; var body: some View { NavigationView { Form { Section(header: Text("Dock Settings")) { Toggle("Enable Dock Auto-Hide", isOn: $enableAutoHide).tint(.blue); Text("Swipe dock left to hide.").font(.caption).foregroundColor(.gray) }; Section(header: Text("Wallpaper")) { ColorPicker("Solid Color", selection: $wallpaperColor).onChange(of: wallpaperColor){_,_ in wallpaperImage=nil}; PhotosPicker(selection: $selectedPhotoItem, matching: .images){ HStack{ Label("Gallery Image", systemImage: "photo"); Spacer(); if wallpaperImage != nil { Text("Set").foregroundColor(.gray).font(.caption) } } }.onChange(of: selectedPhotoItem){ _, ni in Task { if let d = try? await ni?.loadTransferable(type: Data.self), let u = UIImage(data: d) { wallpaperImage = u } } }; Button("Reset Black"){wallpaperImage=nil;wallpaperColor = .black}.foregroundColor(.red) }; Section(header: Text("System")) { Button(action: onClearWindows){Label("Close All Windows", systemImage: "xmark.bin").foregroundColor(.red)} } }.navigationTitle("Settings") } } }
+struct DisintegrationEffect: Identifiable { let id: UUID; let position: CGPoint; let size: CGSize }
+struct DustParticle: Identifiable { let id = UUID(); let startPoint: CGPoint; var endPoint: CGPoint; var scale: CGFloat = 1.0; var opacity: Double = 1.0 }
+struct ModernDustView: View { let windowSize: CGSize; @State private var particles: [DustParticle] = []; @State private var isAnimating = false; var body: some View { ZStack { ForEach(particles){ p in Circle().fill(Color.white.opacity(0.8)).frame(width: 4, height: 4).scaleEffect(isAnimating ? 0.01 : p.scale).opacity(isAnimating ? 0 : p.opacity).offset(x: isAnimating ? p.endPoint.x : p.startPoint.x, y: isAnimating ? p.endPoint.y : p.startPoint.y).animation(.easeOut(duration: Double.random(in: 0.6...1.0)), value: isAnimating) } }.onAppear{createParticles(); DispatchQueue.main.asyncAfter(deadline: .now()+0.01){isAnimating=true}} }; func createParticles() { let rows=20; let cols=20; let cw=windowSize.width/CGFloat(cols); let ch=windowSize.height/CGFloat(rows); for r in 0..<rows{for c in 0..<cols{ let sx=(CGFloat(c)*cw)-(windowSize.width/2); let sy=(CGFloat(r)*ch)-(windowSize.height/2); let sp=CGPoint(x: sx+CGFloat.random(in: -5...5), y: sy+CGFloat.random(in: -5...5)); let ep=CGPoint(x: sx+CGFloat.random(in: -40...40), y: sy-CGFloat.random(in: 20...100)); particles.append(DustParticle(startPoint: sp, endPoint: ep, scale: CGFloat.random(in: 0.5...1.5), opacity: Double.random(in: 0.5...1.0))) }} } }
